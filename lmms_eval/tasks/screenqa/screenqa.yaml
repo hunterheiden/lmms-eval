@@ -1,0 +1,4 @@
+group: screenqa
+task:
+- screenqa_short_val
+- screenqa_short_test
