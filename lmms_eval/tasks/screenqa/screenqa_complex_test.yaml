@@ -1,5 +1,5 @@
-dataset_path: rootsautomation/RICO-ScreenQA-Short
-task: "screenqa_short_test"
+dataset_path: rootsautomation/RICO-ScreenQA-Complex
+task: "screenqa_complex_test"
 test_split: test
 output_type: generate_until
 doc_to_visual: !function utils.screenqa_doc_to_visual

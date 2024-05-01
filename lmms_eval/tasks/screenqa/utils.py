@@ -41,9 +41,6 @@ def screenqa_process_results(doc, results):
     ans = {"id": id, "answer": doc["ground_truth"], "parsed_pred": parsed_pred}
     return {
         "screenqa_f1": ans,
-        "submission": {
-            id: pred,
-        },
     }
 
 
@@ -66,21 +63,34 @@ def evaluate_screenqa_short(samples):
         string = string.lower()
 
         # strip non-alphanumeric characters
-        string = re.sub(r"[^a-zA-Z0-9]", "", string)
+        # string = re.sub(r"[^a-zA-Z0-9]", "", string)
 
         # strip leading and trailing whitespaces
         string = string.strip()
         
         return string
+    
+    def _tokenize(text):
+        # Regex pattern to match words and isolate punctuation
+        pattern = r'\w+|[^\w\s]'
+        tokens = re.findall(pattern, text)
+        return tokens
+
 
     def _compute_f1(sa, sb):
         sa = _normalize_str(sa)
         sb = _normalize_str(sb)
 
+        sa = _tokenize(sa)
+        sb = _tokenize(sb)
+
+        sa = set(sa)
+        sb = set(sb)
+
         if len(sa) == 0 or len(sb) == 0:
             return 0.0
 
-        comm = set(sa).intersection(set(sb))
+        comm = sa.intersection(sb)
         prec = len(comm) / len(sb)
         rec = len(comm) / len(sa)
         f1 = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0
