@@ -1,19 +1,14 @@
 import torch
 import logging
-import copy
 from tqdm import tqdm
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-from lmms_eval.tasks.mmmu.utils_group_img import process_images
 from accelerate import Accelerator, DistributedType
 from accelerate.state import AcceleratorState
 from typing import List, Optional, Union, Tuple
-from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
-
-from lmms_eval.utils import stop_sequences_criteria
-
+from transformers import Idefics2ForConditionalGeneration, AutoProcessor
 
 import warnings
 
@@ -21,19 +16,41 @@ warnings.filterwarnings("ignore")
 
 eval_logger = logging.getLogger("lmms-eval")
 
+DEFAULT_IMAGE_TOKEN = "<image>"
+try: 
+    import flash_attn
+    best_fit_attn_implementation = "flash_attention_2"
+except ImportError:
+    best_fit_attn_implementation = "eager"
 
-@register_model("instructblip")
-class InstructBLIP(lmms):
+@register_model("idefics2")
+class Idefics2(lmms):
     """
-    InstructBLIP Model
+    Idefics2 Model for Hugging Face Transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics2/modeling_idefics2.py
+
+    Example usage:
+
+    accelerate launch --num_processes=8 -m lmms_eval \
+        --model idefics2 \
+        --model_args pretrained=HuggingFaceM4/idefics2-8b \
+        --tasks mme \
+        --batch_size 1 \
+        --output_path ./logs/ \
+        --log_samples
     """
 
     def __init__(
         self,
-        pretrained: str = "Salesforce/instructblip-vicuna-7b",
-        device: Optional[str] = "cuda",
-        dtype: Optional[Union[str, torch.dtype]] = "auto",
-        batch_size: Optional[Union[int, str]] = 1,
+        pretrained: str = "HuggingFaceM4/idefics2-8b",
+        revision: str = "main",
+        device: str = "cuda",
+        dtype: Optional[Union[str, torch.dtype]] = "float16",
+        batch_size: int = 1,
+        trust_remote_code: Optional[bool] = False,
+        attn_implementation: Optional[str] = best_fit_attn_implementation,
+        device_map: str = "",
+        use_cache: bool = True,
+        do_image_splitting: bool =False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -41,18 +58,22 @@ class InstructBLIP(lmms):
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
         accelerator = Accelerator()
-        if accelerator.num_processes > 1:
+        if accelerator.num_processes > 1 and device_map == "":
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+            self.device_map = f"cuda:{accelerator.local_process_index}"
         else:
-            self._device = device
-        self._model = InstructBlipForConditionalGeneration.from_pretrained(pretrained, device_map=self._device)
-        self._image_processor = InstructBlipProcessor.from_pretrained(pretrained)
-        self._tokenizer = self._image_processor.tokenizer
+            self._device = torch.device(device)
+            self.device_map = device_map
+        if isinstance(dtype, str) and dtype != "auto":
+            dtype = getattr(torch, dtype)
+        self._model = Idefics2ForConditionalGeneration.from_pretrained(pretrained, revision=revision, torch_dtype=dtype, device_map=self.device_map, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation)
+        self._processor = AutoProcessor.from_pretrained(pretrained, do_image_splitting=do_image_splitting, revision=revision, trust_remote_code=trust_remote_code)
+
+        self._tokenizer = self._processor.tokenizer
         self._config = self._model.config
-        self.model.eval()
-        self.model.tie_weights()
         self.batch_size_per_gpu = int(batch_size)
-        if accelerator.num_processes > 1:
+        self.use_cache = use_cache
+        if accelerator.num_processes > 1 and device_map == "":
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
             # If you want to use DistributedType.DEEPSPEED, you have to run accelerate config before using the model
             # Also, you have to select zero stage 0 (equivalent to DDP) in order to make the prepare model works
@@ -73,7 +94,12 @@ class InstructBLIP(lmms):
                 eval_logger.info(f"Using {accelerator.num_processes} devices with data parallelism")
             self._rank = self.accelerator.local_process_index
             self._world_size = self.accelerator.num_processes
+        elif accelerator.num_processes == 1 and device_map == "auto":
+            eval_logger.info(f"Using {accelerator.num_processes} devices with pipeline parallelism")
+            self._rank = 0
+            self._word_size = 1
         else:
+            eval_logger.info(f"Using single device: {self._device}")
             self.model.to(self._device)
             self._rank = 0
             self._word_size = 1
@@ -133,8 +159,7 @@ class InstructBLIP(lmms):
         return self.tokenizer.decode(tokens)
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        # TODO
-        assert False, "We have not implemented this function for InstructBLIP yet"
+        raise NotImplementedError("Loglikelihood is not implemented for Idefics2 model")
 
     def flatten(self, input):
         new_list = []
@@ -164,64 +189,35 @@ class InstructBLIP(lmms):
         num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
         pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
         for chunk in chunks:
-            contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
-            task = task[0]
-            split = split[0]
-            visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]
-            visuals = self.flatten(visuals)
+            contexts, all_gen_kwargs, doc_to_visuals, doc_id, tasks, splits = zip(*chunk)
+            visuals = [doc_to_visual(self.task_dict[task][split][ids]) for ids, task, split, doc_to_visual in zip(doc_id, tasks, splits, doc_to_visuals)]
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
             gen_kwargs = all_gen_kwargs[0]
-
-            # Set default values for until and max_new_tokens
-            until = [self.tok_decode(self.eot_token_id)]
-
-            # Update values from gen_kwargs if present
-            if "until" in gen_kwargs:
-                until = gen_kwargs.pop("until")
-                if isinstance(until, str):
-                    until = [until]
-                elif not isinstance(until, list):
-                    raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str,list] but got {type(until)}")
-            assert self.batch_size_per_gpu == 1, "Do not support batch_size_per_gpu > 1 for now"
-            context = contexts[0]
-            if "<image>" in context:
-                # instruct blip does not expect the <image> tag
-                context = context.replace("<image>", "")
-            # Set trunction equals true here, the max length for qformer tokenizer is 512
-            # if not truncate, some questions will cause size mismatch
-            # The transformer implementation can't handle multi images for blip
-            # Concat it into one image
-            if len(visuals) > 1:
-                visuals = [process_images(visuals)]
-            inputs = self._image_processor(images=visuals, text=context, return_tensors="pt", truncation=True).to(self.device)
-
-            gen_kwargs["image_sizes"] = [visuals[idx].size for idx in range(len(visuals))]
-            if "max_new_tokens" not in gen_kwargs:
-                gen_kwargs["max_new_tokens"] = 1024
-            if "temperature" not in gen_kwargs:
-                gen_kwargs["temperature"] = 0
-            if "top_p" not in gen_kwargs:
-                gen_kwargs["top_p"] = None
-            if "num_beams" not in gen_kwargs:
-                gen_kwargs["num_beams"] = 1
-            try:
-                cont = self.model.generate(
-                    **inputs,
-                    do_sample=True if gen_kwargs["temperature"] > 0 else False,
-                    temperature=gen_kwargs["temperature"],
-                    top_p=gen_kwargs["top_p"],
-                    num_beams=gen_kwargs["num_beams"],
-                    max_new_tokens=gen_kwargs["max_new_tokens"],
-                )
-            except Exception as e:
-                eval_logger.error(f"Error {e} in generating")
-                cont = ""
-            text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
-            res.append(text_outputs)
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
+            # 
+            until = gen_kwargs.pop("until", None)
+            image_aspect_ratio = gen_kwargs.pop("image_aspect_ratio",  None)
+            prompts = []
+            for context, visual in zip(contexts, visuals):
+                content = []
+                if DEFAULT_IMAGE_TOKEN not in context:
+                    for image in visual:
+                        content.append({"type": "image"})
+                content.append({"type": "text", "text": context})
+                message = [{"role": "user", "content": content}]
+                prompt = self._processor.apply_chat_template(message, add_generation_prompt=True)
+                prompts.append(prompt)
+            inputs = self._processor(text=prompts, images=visuals, padding=True, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+            # only retain the generated text
+            for output_id, input_id in zip(output_ids, inputs["input_ids"]):
+                generated_id = output_id[len(input_id):]
+                generated_text = self.tokenizer.decode(generated_id, skip_special_tokens=True)
+                
+                res.append(generated_text)
             pbar.update(1)
-            # reorder this group of results back to original unsorted form
+        # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
 
         pbar.close()
